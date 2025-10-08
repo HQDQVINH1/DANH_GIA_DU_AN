@@ -10,7 +10,7 @@ import numpy as np
 
 from docx import Document
 
-# Nếu numpy_financial không có, ta tự hiện IRR; pip install numpy_financial nếu muốn dùng
+# Nếu numpy_financial không có, ta fallback
 try:
     import numpy_financial as nf
     has_nf = True
@@ -19,7 +19,7 @@ except Exception:
 
 # --- Cấu hình Trang Streamlit ---
 st.set_page_config(page_title="App Phân Tích Phương Án Kinh Doanh", layout="wide")
-st.title("App Phân Tích Phương Án Kinh Doanh từ file Word")
+st.title("App Phân Tích Phương Án Kinh Doanh từ file Word — (Phiên bản đã sửa lỗi)")
 
 # --- Utility: đọc text từ file .docx ---
 def read_docx(file_bytes: io.BytesIO) -> str:
@@ -28,18 +28,22 @@ def read_docx(file_bytes: io.BytesIO) -> str:
     return "\n".join(paragraphs)
 
 # --- Utility: chuyển chuỗi số có dấu phẩy, dấu chấm sang float ---
-def parse_number(text: str) -> Optional[float]:
+def parse_number(text: Optional[str]) -> Optional[float]:
     if text is None:
         return None
-    txt = text.strip()
+    if isinstance(text, (int, float, np.integer, np.floating)):
+        return float(text)
+    txt = str(text).strip()
     if txt == "":
         return None
-    # Loại bỏ ký tự không phải số, comma, dot, minus, %
-    # Nếu có %, trả về phân số
+    # Nếu chuỗi chứa chữ (ví dụ tên dự án), trả None
+    # Nhưng vẫn chấp nhận chuỗi có số và chữ đơn vị như "1,2 tỷ"
+    # Kiểm tra nhanh nếu không có bất kỳ chữ số nào thì trả None
+    if not re.search(r'\d', txt):
+        return None
+    # Phát hiện phần trăm
     is_percent = "%" in txt
     txt = txt.replace("%", "")
-    # Thay các dấu không cần thiết
-    # Xử lý trường hợp có đơn vị VND, triệu, tỷ
     multiplier = 1.0
     if re.search(r'\b(tỷ|ty|billion)\b', txt, flags=re.I):
         multiplier = 1e9
@@ -47,21 +51,18 @@ def parse_number(text: str) -> Optional[float]:
     elif re.search(r'\b(triệu|trieu|million)\b', txt, flags=re.I):
         multiplier = 1e6
         txt = re.sub(r'\b(triệu|trieu|million)\b', '', txt, flags=re.I)
-    # Remove non numeric except dot and comma and minus
+    # Loại bỏ ký tự không phải số, dấu chấm, dấu phẩy, dấu âm
     txt = re.sub(r'[^\d\.,\-]', '', txt)
-    # If both comma and dot present, assume comma thousands, dot decimal if dot after comma or vice versa
+    # Chuyển định dạng
     if txt.count(',') > 0 and txt.count('.') > 0:
-        # heuristic: if last '.' occurs after last ',' then dot is decimal
         if txt.rfind('.') > txt.rfind(','):
             txt = txt.replace(',', '')
         else:
             txt = txt.replace('.', '').replace(',', '.')
     else:
-        # If only comma present and groups of 3, treat comma as thousands
-        if txt.count(',') > 0 and re.search(r'\d+,\d{3}(,|\.)', txt) is not None:
-            txt = txt.replace(',', '')
-        else:
-            txt = txt.replace(',', '.')
+        txt = txt.replace(',', '.')
+    # Xử lý chỉ dấu âm lẫn lộn
+    txt = txt.strip('.')
     try:
         val = float(txt)
         if is_percent:
@@ -70,26 +71,24 @@ def parse_number(text: str) -> Optional[float]:
     except Exception:
         return None
 
-# --- Hàm lọc thông tin quan trọng từ văn bản bằng phương pháp Regex + heuristic ---
+# --- Hàm lọc thông tin quan trọng từ văn bản ---
 def extract_project_info(text: str) -> Dict[str, Any]:
-    lower = text.lower()
     info = {
         "Vốn đầu tư": None,
         "Dòng đời dự án (năm)": None,
-        "Doanh thu hàng năm": None,   # có thể là list hoặc số trung bình
+        "Doanh thu hàng năm": None,
         "Chi phí hàng năm": None,
         "WACC": None,
         "Thuế suất": None,
-        "Ghi chú thô": text[:500]  # lưu một đoạn tóm tắt
+        "Ghi chú thô": text[:500]
     }
 
-    # Patterns tìm kiếm các mục phổ biến
+    # Patterns cơ bản
     patterns = {
-        "Vốn đầu tư": r'(vốn đầu tư|đầu tư ban đầu|initial investment|initial cost)[\s\:\-–]*([^\n\r,;]+)',
+        "Vốn đầu tư": r'(vốn đầu tư|tổng vốn|tổng đầu tư|initial investment|capex)[\s\:\-–]*([^\n\r,;]+)',
         "Dòng đời dự án (năm)": r'(dòng đời|thời gian khai thác|thời gian dự án|lifetime|project life)[^\d\n\r]*?(\d{1,2})\s*(năm|year)?',
         "WACC": r'(wacc|chi phí vốn|weighted average cost of capital)[\s\:\-–]*([^\n\r,;]+)',
         "Thuế suất": r'(thuế suất|tax rate|tax)[\s\:\-–]*([^\n\r,;]+%)',
-        # Doanh thu/chi phí có thể xuất hiện nhiều nơi; lấy các câu có "doanh thu" hoặc "doanh số" và "chi phí"
         "Doanh thu hàng năm": r'(doanh thu|revenue|sales)[\s\:\-–]*([^\n\r,;]+)',
         "Chi phí hàng năm": r'(chi phí|costs|expenditure)[\s\:\-–]*([^\n\r,;]+)'
     }
@@ -97,86 +96,111 @@ def extract_project_info(text: str) -> Dict[str, Any]:
     for key, pat in patterns.items():
         m = re.search(pat, text, flags=re.I)
         if m:
-            # giá trị thường ở nhóm 2
             token = m.groups()[-1].strip()
             num = parse_number(token)
-            if key == "Dòng đời dự án (năm)" and num is None:
-                # có thể token là chữ số nhưng parse_number không bắt, thử lấy int
-                try:
-                    num = int(re.search(r'(\d{1,2})', token).group(1))
-                except Exception:
-                    num = None
             info[key] = num if num is not None else token
 
-    # Nếu không tìm thấy WACC dạng %, thử tìm số có % sau "chi phí vốn"
+    # Thử thêm phát hiện WACC không có ký hiệu %
     if info["WACC"] is None:
         m = re.search(r'chi phí vốn[\s\:\-–]*([0-9\.,]+)\s*%', text, flags=re.I)
         if m:
-            w = parse_number(m.group(1) + "%")
-            info["WACC"] = w
-
-    # Thuế suất nếu ở dạng số không có %:
+            info["WACC"] = parse_number(m.group(1) + "%")
+    # Thuế suất dạng "Thuế: 20%" hoặc "thuế suất 20%"
     if info["Thuế suất"] is None:
-        m = re.search(r'thuế\s*:\s*([0-9\.,]+)\s*%', text, flags=re.I)
+        m = re.search(r'thuế\s*(suất)?[\s\:\-–]*([0-9\.,]+)\s*%', text, flags=re.I)
         if m:
-            info["Thuế suất"] = parse_number(m.group(1) + "%")
+            info["Thuế suất"] = parse_number(m.group(2) + "%")
 
-    # Nếu doanh thu/chi phí xuất hiện nhiều lần, gom các con số xuất hiện gần từ khóa
+    # Gom các số gần từ khóa doanh thu/chi phí nếu không tìm được giá trị đơn
     revenues = []
     costs = []
     for line in text.splitlines():
         if re.search(r'\b(doanh thu|revenue|sales)\b', line, flags=re.I):
-            # tìm các số trong dòng
             for numstr in re.findall(r'[\d\.,]+\s*(tỷ|ty|triệu|trieu)?\b', line, flags=re.I):
                 n = parse_number(numstr)
-                if n:
+                if n is not None:
                     revenues.append(n)
         if re.search(r'\b(chi phí|cost|costs|expenditure)\b', line, flags=re.I):
             for numstr in re.findall(r'[\d\.,]+\s*(tỷ|ty|triệu|trieu)?\b', line, flags=re.I):
                 n = parse_number(numstr)
-                if n:
+                if n is not None:
                     costs.append(n)
-
     if revenues and info["Doanh thu hàng năm"] is None:
-        # lấy trung bình nếu có nhiều năm trình bày
         info["Doanh thu hàng năm"] = sum(revenues) / len(revenues)
     if costs and info["Chi phí hàng năm"] is None:
         info["Chi phí hàng năm"] = sum(costs) / len(costs)
 
-    # Try: nếu vốn đầu tư chưa có, thử tìm các cụm "tổng vốn" hoặc "capex"
+    # Nếu vốn đầu tư vẫn là chuỗi mô tả (ví dụ tên dự án), cố gắng tìm số trong text chung
     if info["Vốn đầu tư"] is None:
-        m = re.search(r'(tổng vốn|tổng đầu tư|capex|capital\s*expenditure)[\s\:\-–]*([^\n\r,;]+)', text, flags=re.I)
+        m = re.search(r'(vốn|tổng vốn|tổng đầu tư|capex)[^\d\n\r]*([\d\.,]+\s*(tỷ|ty|triệu|trieu)?)', text, flags=re.I)
         if m:
-            info["Vốn đầu tư"] = parse_number(m.groups()[-1])
+            info["Vốn đầu tư"] = parse_number(m.group(2))
 
-    # Nếu vẫn thiếu Dòng đời, để mặc định 5 năm (giả định hợp lý)
+    # Mặc định nếu vẫn None
     if info["Dòng đời dự án (năm)"] is None:
         info["Dòng đời dự án (năm)"] = 5
-
-    # Nếu WACC chưa có, dùng mặc định 10%
     if info["WACC"] is None:
         info["WACC"] = 0.10
-
-    # Nếu Thuế suất chưa có, dùng 20%
     if info["Thuế suất"] is None:
         info["Thuế suất"] = 0.20
+
+    # Chuyển các giá trị string sang numeric nếu có thể
+    for key in ["Vốn đầu tư", "Doanh thu hàng năm", "Chi phí hàng năm", "WACC", "Thuế suất"]:
+        val = info.get(key)
+        if isinstance(val, str):
+            parsed = parse_number(val)
+            if parsed is not None:
+                info[key] = parsed
 
     return info
 
 # --- Xây bảng dòng tiền dự án từ thông tin đã lọc ---
 def build_cashflow_table(info: Dict[str, Any]) -> pd.DataFrame:
-    life = int(info.get("Dòng đời dự án (năm)", 5))
-    capex = info.get("Vốn đầu tư", 0) or 0
-    # Nếu Doanh thu/Chi phí là list hoặc số: dùng as is; nếu None -> 0
-    revenue = info.get("Doanh thu hàng năm", 0) or 0
-    cost = info.get("Chi phí hàng năm", 0) or 0
+    # Lấy giá trị và ép kiểu an toàn
+    try:
+        life = int(info.get("Dòng đời dự án (năm)", 5) or 5)
+    except Exception:
+        life = 5
+
+    capex_raw = info.get("Vốn đầu tư", 0)
+    revenue_raw = info.get("Doanh thu hàng năm", 0)
+    cost_raw = info.get("Chi phí hàng năm", 0)
     tax = info.get("Thuế suất", 0.2) or 0.2
 
-    # Giả định: Doanh thu và chi phí ổn định qua các năm trừ năm đầu có CapEx
+    capex = parse_number(capex_raw) if capex_raw is not None else None
+    revenue = parse_number(revenue_raw) if revenue_raw is not None else None
+    cost = parse_number(cost_raw) if cost_raw is not None else None
+
+    # Nếu parse không thành công, đặt mặc định và thông báo
+    warnings = []
+    if capex is None:
+        warnings.append("Vốn đầu tư không xác định hoặc không phải số, dùng capex = 0")
+        capex = 0.0
+    if revenue is None:
+        warnings.append("Doanh thu hàng năm không xác định, dùng doanh thu = 0")
+        revenue = 0.0
+    if cost is None:
+        warnings.append("Chi phí hàng năm không xác định, dùng chi phí = 0")
+        cost = 0.0
+    if not isinstance(tax, (int, float, np.integer, np.floating)):
+        # cố parse nếu là string như "20%"
+        tparsed = parse_number(str(tax))
+        tax = tparsed if tparsed is not None else 0.2
+        if tparsed is None:
+            warnings.append("Thuế suất không hợp lệ, dùng thuế suất = 0.2")
+
+    # Hiển thị cảnh báo trong Streamlit nếu có
+    if warnings:
+        for w in warnings:
+            st.warning(w)
+
     rows = []
     for year in range(0, life + 1):
         if year == 0:
-            # Dòng tiền đầu tư ban đầu âm
+            try:
+                capex_val = -abs(float(capex))
+            except Exception:
+                capex_val = 0.0
             rows.append({
                 "Năm": year,
                 "Doanh thu": 0.0,
@@ -184,18 +208,18 @@ def build_cashflow_table(info: Dict[str, Any]) -> pd.DataFrame:
                 "EBIT": 0.0,
                 "Thuế": 0.0,
                 "NOPAT": 0.0,
-                "CapEx": -abs(capex),
-                "Dòng tiền ròng": -abs(capex)
+                "CapEx": capex_val,
+                "Dòng tiền ròng": capex_val
             })
         else:
-            ebit = revenue - cost
-            tax_amt = ebit * tax if ebit > 0 else 0.0
+            ebit = float(revenue) - float(cost)
+            tax_amt = ebit * float(tax) if ebit > 0 else 0.0
             nopat = ebit - tax_amt
-            cf = nopat  # giả định không có thay đổi vốn lưu động, khấu hao không tách riêng
+            cf = nopat
             rows.append({
                 "Năm": year,
-                "Doanh thu": revenue,
-                "Chi phí": cost,
+                "Doanh thu": float(revenue),
+                "Chi phí": float(cost),
                 "EBIT": ebit,
                 "Thuế": tax_amt,
                 "NOPAT": nopat,
@@ -207,16 +231,12 @@ def build_cashflow_table(info: Dict[str, Any]) -> pd.DataFrame:
 
 # --- Tính các chỉ số tài chính ---
 def compute_project_metrics(cashflows: List[float], discount_rate: float) -> Dict[str, Any]:
-    # cashflows: list với năm 0..N (năm0 âm)
-    # NPV
     npv = sum(cf / ((1 + discount_rate) ** i) for i, cf in enumerate(cashflows))
-    # IRR
     irr = None
     try:
         if has_nf:
             irr = nf.irr(cashflows)
         else:
-            # Newton-Raphson đơn giản cho IRR
             def npv_func(r):
                 return sum(cf / ((1 + r) ** i) for i, cf in enumerate(cashflows))
             def npv_derivative(r):
@@ -233,47 +253,36 @@ def compute_project_metrics(cashflows: List[float], discount_rate: float) -> Dic
                     break
                 r = newr
             irr = r
-            if irr <= -0.9999 or math.isnan(irr) or abs(irr) > 1e6:
+            if irr is None or irr <= -0.9999 or math.isnan(irr) or abs(irr) > 1e9:
                 irr = None
     except Exception:
         irr = None
 
-    # PP: thời gian hoàn vốn (không chiết khấu)
     cumulative = 0.0
     pp = None
     for i, cf in enumerate(cashflows):
         cumulative += cf
         if cumulative >= 0 and i > 0:
-            # tính phần năm dùng linear interpolation
             prev_cum = cumulative - cf
-            frac = (0 - prev_cum) / (cf) if cf != 0 else 0
+            frac = (0 - prev_cum) / cf if cf != 0 else 0
             pp = (i - 1) + frac
             break
 
-    # DPP: thời gian hoàn vốn có chiết khấu
     cumulative_d = 0.0
     dpp = None
     for i, cf in enumerate(cashflows):
         discounted = cf / ((1 + discount_rate) ** i)
         cumulative_d += discounted
         if cumulative_d >= 0 and i > 0:
-            # tìm phần năm
-            # recompute previous discounted cumulative
             prev_cum_d = cumulative_d - discounted
-            frac = (0 - prev_cum_d) / (discounted) if discounted != 0 else 0
+            frac = (0 - prev_cum_d) / discounted if discounted != 0 else 0
             dpp = (i - 1) + frac
             break
 
-    return {
-        "NPV": npv,
-        "IRR": irr,
-        "PP (years)": pp,
-        "DPP (years)": dpp
-    }
+    return {"NPV": npv, "IRR": irr, "PP (years)": pp, "DPP (years)": dpp}
 
-# --- Hàm gọi AI để phân tích kết quả (thử OpenAI rồi Gemini nếu có) ---
+# --- Hàm gọi AI (giữ nguyên như trước; tùy cấu hình secrets) ---
 def get_ai_comment(summary_text: str) -> str:
-    # Thử OpenAI (openai-python) nếu có key
     openai_key = None
     try:
         openai_key = st.secrets["OPENAI_API_KEY"]
@@ -297,10 +306,8 @@ def get_ai_comment(summary_text: str) -> str:
             )
             return resp.choices[0].message.content.strip()
         except Exception as e:
-            # Không crash app khi AI lỗi, trả về lỗi dạng văn bản
             return f"Lỗi gọi OpenAI: {e}"
 
-    # Nếu không có OpenAI, thử Google GenAI (gemini) nếu có key
     try:
         gem_key = st.secrets.get("GEMINI_API_KEY") or None
     except Exception:
@@ -329,27 +336,24 @@ uploaded = st.file_uploader("1. Tải file Word (docx) phương án kinh doanh",
 
 col1, col2 = st.columns([1, 1])
 with col1:
-    use_ai_extract = st.checkbox("Sử dụng AI/heuristic để trích xuất thông tin (khuyến nghị)", value=True)
+    use_ai_extract = st.checkbox("Sử dụng heuristic để trích xuất thông tin (khuyến nghị)", value=True)
 with col2:
     override_life = st.number_input("Ghi đè Dòng đời dự án (năm) (0 để giữ giá trị trích xuất)", min_value=0, step=1, value=0)
 
 if uploaded is not None:
     try:
-        # đọc docx
         doc_bytes = io.BytesIO(uploaded.read())
         full_text = read_docx(doc_bytes)
 
-        st.subheader("Tóm tắt nội dung đầu tiên (first 500 chars)")
+        st.subheader("Tóm tắt nội dung đầu tiên")
         st.code(full_text[:1000])
 
-        if st.button("2. Lọc thông tin dự án"):
-            # trích xuất thông tin
+        if st.button("Trích thông tin dự án"):
             info = extract_project_info(full_text) if use_ai_extract else {
                 "Vốn đầu tư": None, "Dòng đời dự án (năm)": None, "Doanh thu hàng năm": None,
                 "Chi phí hàng năm": None, "WACC": None, "Thuế suất": None, "Ghi chú thô": full_text[:500]
             }
 
-            # Nếu người dùng override dòng đời
             if override_life > 0:
                 info["Dòng đời dự án (năm)"] = int(override_life)
 
@@ -364,7 +368,6 @@ if uploaded is not None:
             }
             st.json(display_info)
 
-            # Xây bảng dòng tiền
             st.subheader("3. Bảng Dòng Tiền Dự Án (giả định đơn giản)")
             df_cf = build_cashflow_table(info)
             st.dataframe(df_cf.style.format({
@@ -377,27 +380,34 @@ if uploaded is not None:
                 "Dòng tiền ròng": "{:,.0f}"
             }), use_container_width=True)
 
-            # Tính chỉ số
             st.subheader("4. Tính các chỉ số đánh giá hiệu quả")
             discount_rate = st.number_input("Chiết khấu dùng cho NPV/DPP (WACC mặc định nếu có)", min_value=0.0, max_value=1.0, value=float(info.get("WACC") or 0.1), step=0.01)
             cashflows = df_cf["Dòng tiền ròng"].tolist()
             metrics = compute_project_metrics(cashflows, discount_rate)
 
-            # Hiển thị metrics
             mdf = pd.DataFrame([{
                 "NPV (VND)": metrics["NPV"],
                 "IRR (decimal)": metrics["IRR"],
                 "PP (năm)": metrics["PP (years)"],
                 "DPP (năm)": metrics["DPP (years)"]
             }])
-            st.table(mdf.style.format({
-                "NPV (VND)": "{:,.0f}",
-                "IRR (decimal)": "{:.2%}",
-                "PP (năm)": "{:.2f}",
-                "DPP (năm)": "{:.2f}"
-            }).applymap(lambda v: "N/A" if (v is None or (isinstance(v, float) and (math.isnan(v) or abs(v) > 1e9))) else v))
+            # Format hiển thị, xử lý None
+            def fmt(x, fmtstr):
+                try:
+                    if x is None:
+                        return "N/A"
+                    if isinstance(x, float) and (math.isnan(x) or abs(x) > 1e18):
+                        return "N/A"
+                    return fmtstr.format(x)
+                except Exception:
+                    return str(x)
+            st.table(mdf.rename(columns={
+                "NPV (VND)": "NPV (VND)",
+                "IRR (decimal)": "IRR (decimal)",
+                "PP (năm)": "PP (năm)",
+                "DPP (năm)": "DPP (năm)"
+            }).to_dict(orient='records'))
 
-            # Nút yêu cầu AI phân tích các chỉ số
             st.subheader("5. Yêu cầu AI phân tích các chỉ số")
             summary = f"Thông tin dự án:\n{display_info}\n\nBảng dòng tiền (tóm tắt):\n{df_cf.to_csv(index=False)}\n\nCác chỉ số:\nNPV={metrics['NPV']}\nIRR={metrics['IRR']}\nPP={metrics['PP (years)']}\nDPP={metrics['DPP (years)']}\nChiết khấu dùng={discount_rate}\n"
             if st.button("Gửi yêu cầu AI phân tích chỉ số"):
